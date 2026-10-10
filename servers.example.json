@@ -1,0 +1,14 @@
+[
+  {
+    "id": "hosting-01",
+    "host": "hosting-01.example.com",
+    "name": "Hosting principal",
+    "primary": "WHM",
+    "ports": {"HTTPS": 443, "WHM": 2087, "cPanel": 2083, "SSH": 22},
+    "whm_user": "root",
+    "whm_token_env": "WHM_HOSTING_01_TOKEN",
+    "metrics_url": "https://metrics-hosting-01.example.com/metrics",
+    "metrics_token_env": "METRICS_HOSTING_01_TOKEN",
+    "load_warning": 6
+  }
+]

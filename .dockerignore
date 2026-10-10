@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+access.txt
+servers.json
+secrets.json
+auth.json
+data/
+__pycache__/
+*.sqlite*
+*.pyc
+*.zip
+tmp*/
+scripts/
+test_*.py
+.git/

@@ -1,0 +1,36 @@
+services:
+  panel:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      DEMO: "${DEMO:-0}"
+      ALLOWED_ORIGIN: "${ALLOWED_ORIGIN:?Define ALLOWED_ORIGIN en .env}"
+    env_file:
+      - .env
+    volumes:
+      - panel-data:/data
+      - ./servers.json:/config/servers.json:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 0.75
+    pids_limit: 100
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  panel-data:
