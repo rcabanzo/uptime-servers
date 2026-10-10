@@ -2,7 +2,11 @@
 
 Panel de monitorización WHM/cPanel con servidores en filas desplegables, CPU, RAM, disco, carga, disponibilidad e historial CSV. Comprobaciones cada 60 segundos, historial de 30 días y sesiones de 24 horas.
 
-Diseño oscuro adaptable: filas compactas en escritorio, tarjetas con métricas etiquetadas en móvil, gráficas SVG de carga y latencia TCP, barras de recursos e historial de disponibilidad. Las gráficas conservan los intervalos sin muestras; no generan datos históricos de CPU/RAM inexistentes.
+Consola oscura con identidad visual común en el panel, login y formulario de conexión. Filas compactas en escritorio y tarjetas con métricas etiquetadas en móvil, navegación inferior táctil, resumen de infraestructura y gráfica de latencia media de los destinos. Sin fuentes, librerías o servicios externos en el navegador.
+
+Cada servidor despliega gráficas SVG de carga y latencia TCP con selector de 2/24 horas, medias y picos; barras de CPU/RAM/disco y comprobaciones de disponibilidad. Las gráficas conservan los intervalos sin muestras y los huecos entre comprobaciones. No se generan históricos ficticios de CPU/RAM. Búsqueda por nombre o dirección, filtros, alertas y exportación CSV.
+
+El diseño contempla navegación por teclado, foco visible, reducción de movimiento y pantallas de 320 px en adelante. La sesión continúa siendo de 24 horas; las comprobaciones del backend mantienen su intervalo de 60 segundos.
 
 ## Configuración
 
