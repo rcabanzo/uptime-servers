@@ -14,6 +14,7 @@ const icons = {
   chevron:'<path d="m9 5 7 7-7 7"/>',close:'<path d="m6 6 12 12M6 18 18 6"/>',
   shield:'<path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6z"/><path d="m8 12 3 3 5-6"/>',
   arrow:'<path d="M7 17 17 7M7 7h10v10"/>',download:'<path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/>',
+  edit:'<path d="m16 3 5 5L9 20l-6 1 1-6zM13 6l5 5"/>',
   check:'<path d="m5 12 4 4L19 6"/>',warning:'<path d="m12 3 10 18H2zM12 9v5m0 3h.01"/>',disk:'<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M3 13h18M16 16h.01M12 16h.01"/>'
 };
 const icon = name => `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] || icons.activity}</svg>`;
@@ -27,6 +28,7 @@ const safeURL = value => { try { const url = new URL(value); return url.protocol
 const serverHost = server => { try { return server.host || server.hostname || new URL(safeURL(server.whmUrl)).hostname; } catch { return ''; } };
 let data = { servers:[], demo:false }, expanded = new Set(), view = 'servers', remaining = 60, busy = false, csrf = '', chartId = 0, firstLoad = true;
 const ranges = new Map();
+let editingId = null, dialogRequest = 0, alertSignature = null;
 function bar(value, color='mint') {
   const width = Number.isFinite(value) ? Math.max(0,Math.min(100,value)) : 0;
   return `<span class="resource-bar"><span class="${value >= 90 ? 'amber' : color}" style="width:${width}%"></span></span>`;
@@ -75,7 +77,7 @@ function rowMetric(label,value,progress,color='') {
 }
 function serverRow(server) {
   const open=expanded.has(server.id), host=serverHost(server)||'WHM / cPanel';
-  return `<article class="server ${open?'is-open':''}" data-status="${esc(server.status)}"><button class="row server-row" data-expand="${esc(server.id)}" aria-expanded="${open}" aria-controls="detail-${esc(server.id)}"><span class="server-identity"><span class="server-icon ${esc(server.status)}">${icon('servers')}</span><span class="server-name"><strong>${esc(server.name)}</strong><small><span class="status-dot ${esc(server.status)}"></span>${esc(statusName(server.status))}<span class="host-address"> · ${esc(host)}</span></small></span></span>${rowMetric('Disco',pct(server.disk),server.disk,server.disk>=90?'amber-text':'')}${rowMetric('Carga',num(server.load),undefined,server.load>=6?'amber-text':'')}${rowMetric('CPU',pct(server.cpu),server.cpu)}${rowMetric('RAM',pct(server.ram),server.ram)}${rowMetric('Uptime',pct(server.uptime),undefined,server.status==='down'?'red-text':'mint-text')}${rowMetric('Latencia',server.latency==null?'—':`${num(server.latency)} <small>ms</small>`)}<span class="expand-icon">${icon('chevron')}</span></button>${open?details(server):`<div id="detail-${esc(server.id)}" hidden></div>`}</article>`;
+  return `<article class="server ${open?'is-open':''}" data-status="${esc(server.status)}"><div class="server-row-wrap"><button class="row server-row" data-expand="${esc(server.id)}" aria-expanded="${open}" aria-controls="detail-${esc(server.id)}"><span class="server-identity"><span class="server-icon ${esc(server.status)}">${icon('servers')}</span><span class="server-name"><strong>${esc(server.name)}</strong><small><span class="status-dot ${esc(server.status)}"></span>${esc(statusName(server.status))}<span class="host-address"> · ${esc(host)}</span></small></span></span>${rowMetric('Disco',pct(server.disk),server.disk,server.disk>=90?'amber-text':'')}${rowMetric('Carga',num(server.load),undefined,server.load>=6?'amber-text':'')}${rowMetric('CPU',pct(server.cpu),server.cpu)}${rowMetric('RAM',pct(server.ram),server.ram)}${rowMetric('Uptime',pct(server.uptime),undefined,server.status==='down'?'red-text':'mint-text')}${rowMetric('Latencia',server.latency==null?'—':`${num(server.latency)} <small>ms</small>`)}<span class="expand-icon">${icon('chevron')}</span></button>${!data.demo?`<button class="icon-button server-edit" data-edit="${esc(server.id)}" aria-label="Editar ${esc(server.name)}" title="Editar servidor">${icon('edit')}</button>`:''}</div>${open?details(server):`<div id="detail-${esc(server.id)}" hidden></div>`}</article>`;
 }
 function emptyState(filtered=false) {
   return `<div class="empty-state"><span class="empty-illustration">${icon(filtered?'search':'servers')}<span class="empty-orbit"></span></span><p class="eyebrow">${filtered?'AJUSTA TU BÚSQUEDA':'TODO EMPIEZA CON UN SERVIDOR'}</p><h3>${filtered?'No encontramos coincidencias.':'Un lugar para toda tu infraestructura.'}</h3><p>${filtered?'Prueba otro nombre, dirección o estado.':'Conecta tu primer servidor WHM para seguir su carga, recursos y disponibilidad.'}</p><button class="${filtered?'secondary':'primary'}" ${filtered?'data-reset-filter':'data-add-server'}>${icon(filtered?'refresh':'plus')}${filtered?'Limpiar filtros':'Conectar mi primer servidor'}</button><small>${filtered?'':'Comprobaciones automáticas cada 60 segundos'}</small></div>`;
@@ -85,11 +87,20 @@ function renderSummary() {
   const cards=[['servers',servers.length,'Servidores','Toda tu infraestructura',''],['activity',online.length,'En línea','Responden a la conexión TCP','mint'],['bell',alerts.length,'Necesitan atención',alerts.length?'Revisa las alertas activas':'Sin alertas activas',alerts.length?'amber':''],['shield',pct(uptime),'Disponibilidad','Muestras registradas · 24 h','blue']];
   $('#summary').innerHTML=cards.map(([name,value,label,note,tone],i)=>`<article class="summary-card ${tone}"><div class="summary-top"><span>${label}</span><span class="summary-icon">${icon(name)}</span></div><strong class="summary-value">${value}</strong><div class="summary-note">${i===1?'<span class="status-dot"></span>':''}${note}</div></article>`).join('');
   $('#serverCount').textContent=servers.length;$('#alertBadge').textContent=alerts.length;$('#alertBadge').hidden=!alerts.length;$('#listCount').textContent=servers.length;
-  $('#healthDot').className=`status-dot ${alerts.some(s=>s.status==='down')?'down':alerts.length?'warning':''}`;
-  $('#healthLabel').textContent=servers.length?(alerts.length?'HAY DESTINOS CON ALERTAS':'SISTEMAS OPERATIVOS'):'LISTO PARA CONECTAR';
-  $('#healthTitle').textContent=servers.length?(alerts.length?`${alerts.length} ${alerts.length===1?'servidor necesita':'servidores necesitan'} una revisión.`:'Todo funciona como debe.'):'Tu siguiente servidor empieza aquí.';
-  $('#healthDescription').textContent=servers.length?`${online.length} de ${servers.length} destinos responden. El monitor sigue trabajando aunque cierres el panel.`:'Visibilidad de recursos y disponibilidad. Configura un destino y deja que el monitor haga el resto.';
-  $('#fleetLatency').innerHTML=`${num(mean(servers.map(s=>s.latency).filter(Number.isFinite)))} <small>ms</small>`;$('#fleetChart').innerHTML=graph(fleetHistory(),'latency',true);
+  renderPopup(alerts);
+}
+function setPopup(open,focus=false) {
+  $('#alertsPopup').hidden=!open;$('#alertsToggle').setAttribute('aria-expanded',String(open));
+  if(open&&focus)$('#closeAlerts').focus({preventScroll:true});
+}
+function renderPopup(alerts) {
+  $('#popupBadge').textContent=alerts.length;$('#popupBadge').hidden=!alerts.length;
+  $('#popupDescription').textContent=alerts.length?`${alerts.length} ${alerts.length===1?'servidor requiere':'servidores requieren'} atención`:'Sin alertas activas';
+  $('#popupContent').innerHTML=alerts.length?alerts.map(s=>`<article class="popup-alert"><span class="status-dot ${s.status==='down'?'down':'warning'}"></span><div><h3>${esc(s.name)}</h3><p>${esc(s.error||(s.disk>=90?'El uso de disco supera el 90%.':'Revisa los recursos o los servicios del servidor.'))}</p><button class="text-button" data-open="${esc(s.id)}">Revisar servidor ${icon('arrow')}</button></div></article>`).join(''):`<div class="popup-clear">${icon('shield')}<p>${data.servers.length?'Todos los servidores están operativos.':'Conecta un servidor para comenzar.'}</p></div>`;
+  $('#fleetLatency').innerHTML=`${num(mean(data.servers.map(s=>s.latency).filter(Number.isFinite)))} <small>ms</small>`;$('#fleetChart').innerHTML=graph(fleetHistory(),'latency',true);
+  const signature=JSON.stringify(alerts.map(s=>[s.id,s.status,s.error]).sort((a,b)=>a[0].localeCompare(b[0])));
+  if(signature!==alertSignature&&alerts.length)setPopup(true);
+  alertSignature=signature;
 }
 function renderList() {
   const focus=document.activeElement?.dataset,query=$('#search').value.trim().toLowerCase(),filter=$('#filter').value;
@@ -99,8 +110,8 @@ function renderList() {
   if(focus?.range)[...document.querySelectorAll('[data-range]')].find(b=>b.dataset.server===focus.server&&b.dataset.range===focus.range)?.focus({preventScroll:true});
 }
 function renderView() {
-  const titles={servers:['Tu infraestructura.<br><span>Bajo control.</span>','Cada servidor, cada recurso, en una sola vista.','Servidores'],monitor:['Siempre en línea.<br><span>Siempre a la vista.</span>','Disponibilidad y rendimiento de tus servidores.','Monitorización'],alerts:['Lo que necesita<br><span>tu atención.</span>','Detecta y revisa los destinos con incidencias.','Alertas'],settings:['A tu manera.<br><span>Todo preparado.</span>','Conoce cómo funciona tu centro de operaciones.','Ajustes']};
-  const info=titles[view];$('#title').innerHTML=info[0];$('#subtitle').textContent=info[1];$('#breadcrumb').textContent=info[2];document.title=`ServerPanel · ${info[2]}`;
+  const title={servers:'Servidores',monitor:'Monitorización',alerts:'Alertas',settings:'Ajustes'}[view];
+  $('#title').textContent=title;$('#breadcrumb').textContent=title;document.title=`ServerPanel · ${title}`;
   document.querySelectorAll('nav button').forEach(b=>{b.classList.toggle('selected',b.dataset.view===view);if(b.dataset.view===view)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');});
   const list=['servers','monitor'].includes(view);$('#serversView').hidden=!list;$('#otherView').hidden=list;
   if(view==='alerts') {
@@ -111,7 +122,31 @@ function renderView() {
 }
 function render(){renderSummary();renderList();renderView();}
 function notice(message,tone=''){$('#notice').textContent=message;$('#notice').hidden=!message;$('#notice').className=`notice ${tone}`;}
-function openDialog(){$('#serverForm').reset();$('#formError').textContent='';$('#serverDialog').showModal();}
+function openDialog() {
+  dialogRequest++;editingId=null;const form=$('#serverForm');form.reset();form.querySelector('details').open=false;
+  $('#formError').textContent='';$('#dialogTitle').textContent='Conectar un servidor';$('#dialogEyebrow').textContent='AMPLÍA TU INFRAESTRUCTURA';
+  $('#dialogIntro').textContent='Añade un destino WHM y empieza a seguir su disponibilidad.';
+  $('#clearWhmLabel').hidden=true;$('#clearMetricsLabel').hidden=true;
+  form.elements.whmToken.placeholder='Para consultar la carga del servidor';form.elements.metricsToken.placeholder='';
+  $('#saveServer').innerHTML=icon('plus')+'Conectar y monitorizar';$('#saveServer').disabled=false;$('#serverDialog').showModal();
+}
+async function editServer(id) {
+  openDialog();editingId=id;const request=dialogRequest;$('#saveServer').disabled=true;
+  $('#dialogTitle').textContent='Editar servidor';$('#dialogEyebrow').textContent='CONFIGURACIÓN DEL SERVIDOR';
+  $('#dialogIntro').textContent='Deja los tokens vacíos para conservar los actuales. El historial se mantiene.';
+  $('#saveServer').innerHTML=icon('check')+'Guardar cambios';
+  try {
+    const response=await fetch('/api/servers/'+encodeURIComponent(id),{cache:'no-store'});
+    if(response.status===401){window.location.replace('/login');return;}
+    const settings=await response.json();if(!response.ok)throw Error(settings.error||'No se pudo cargar el servidor.');
+    if(request!==dialogRequest||!$('#serverDialog').open)return;
+    const form=$('#serverForm');['name','host','whm_user','whm_port','metrics_url'].forEach(key=>form.elements[key].value=settings[key]??'');
+    form.elements.whmToken.placeholder=settings.hasWhmToken?'Token guardado · vacío para conservarlo':'Sin token guardado';
+    form.elements.metricsToken.placeholder=settings.hasMetricsToken?'Token guardado · vacío para conservarlo':'Sin token guardado';
+    $('#clearWhmLabel').hidden=!settings.hasWhmToken;$('#clearMetricsLabel').hidden=!settings.hasMetricsToken;
+    form.querySelector('details').open=Boolean(settings.metrics_url);$('#saveServer').disabled=false;
+  } catch(error){if(request===dialogRequest)$('#formError').textContent=error.message;}
+}
 function toast(message){$('#toast').textContent=message;$('#toast').hidden=false;setTimeout(()=>$('#toast').hidden=true,5000);}
 async function refresh() {
   if(busy)return;busy=true;$('#refresh').disabled=true;$('#refresh').classList.add('refreshing');
@@ -133,16 +168,32 @@ document.addEventListener('click',event=>{
   const b=event.target.closest('button');if(!b)return;
   if(b.dataset.expand){expanded.has(b.dataset.expand)?expanded.delete(b.dataset.expand):expanded.add(b.dataset.expand);renderList();}
   if(b.dataset.view){view=b.dataset.view;if(view==='monitor'){data.servers.forEach(s=>expanded.add(s.id));renderList();}renderView();}
-  if(b.dataset.open){view='servers';expanded.add(b.dataset.open);renderList();renderView();[...document.querySelectorAll('[data-expand]')].find(el=>el.dataset.expand===b.dataset.open)?.scrollIntoView({block:'start',behavior:'smooth'});}
+  if(b.dataset.open){setPopup(false);view='servers';expanded.add(b.dataset.open);renderList();renderView();[...document.querySelectorAll('[data-expand]')].find(el=>el.dataset.expand===b.dataset.open)?.scrollIntoView({block:'start',behavior:'smooth'});}
   if(b.dataset.range){ranges.set(b.dataset.server,Number(b.dataset.range));renderList();}
   if(b.dataset.history)exportHistory(b.dataset.history);
+  if(b.dataset.edit)editServer(b.dataset.edit);
+  if(b.hasAttribute('data-toggle-alerts'))setPopup($('#alertsPopup').hidden,true);
   if(b.hasAttribute('data-add-server'))openDialog();
   if(b.hasAttribute('data-reset-filter')){$('#search').value='';$('#filter').value='all';renderList();}
 });
 $('#search').addEventListener('input',renderList);$('#filter').addEventListener('change',renderList);$('#refresh').addEventListener('click',refresh);$('#addServer').addEventListener('click',openDialog);$('#closeDialog').addEventListener('click',()=>$('#serverDialog').close());
+$('#alertsToggle').addEventListener('click',()=>setPopup($('#alertsPopup').hidden,true));
+$('#closeAlerts').addEventListener('click',()=>{setPopup(false);$('#alertsToggle').focus({preventScroll:true});});
+document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!$('#serverDialog').open&&!$('#alertsPopup').hidden){setPopup(false);$('#alertsToggle').focus({preventScroll:true});}});
+$('#serverDialog').addEventListener('close',()=>{dialogRequest++;editingId=null;$('#serverForm').reset();});
 $('#serverForm').addEventListener('submit',async event=>{
   event.preventDefault();$('#saveServer').disabled=true;$('#formError').textContent='';
-  try{const payload=Object.fromEntries(new FormData(event.target)),response=await fetch('/api/servers',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(payload)}),result=await response.json();if(response.status===401){window.location.replace('/login');return;}if(!response.ok)throw Error(result.error||'No se pudo guardar el servidor.');$('#serverForm').reset();$('#serverDialog').close();toast('Servidor conectado. Su primera comprobación aparecerá en unos segundos.');setTimeout(refresh,12000);}
+  const id=editingId;
+  try {
+    const payload=Object.fromEntries(new FormData(event.target));
+    ['clearWhmToken','clearMetricsToken'].forEach(key=>payload[key]=event.target.elements[key].checked);
+    const response=await fetch('/api/servers'+(id?'/'+encodeURIComponent(id):''),{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(payload)}),result=await response.json();
+    if(response.status===401){window.location.replace('/login');return;}
+    if(!response.ok)throw Error(result.error||'No se pudo guardar el servidor.');
+    $('#serverDialog').close();
+    if(id){const server=data.servers.find(s=>s.id===id);if(server){server.name=payload.name;server.host=payload.host;server.whmUrl=`https://${payload.host}:${payload.whm_port}`;}renderList();}
+    toast(id?'Cambios guardados. Se comprobará la nueva configuración en unos segundos.':'Servidor conectado. Su primera comprobación aparecerá en unos segundos.');setTimeout(refresh,12000);
+  }
   catch(error){$('#formError').textContent=error.message;}finally{$('#saveServer').disabled=false;}
 });
 $('#logout').addEventListener('click',async()=>{try{const response=await fetch('/api/logout',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:'{}'});if(!response.ok&&response.status!==401)throw Error();window.location.replace('/login');}catch{notice('No se pudo cerrar la sesión. Vuelve a intentarlo.','error');}});

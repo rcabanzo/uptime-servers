@@ -1,5 +1,7 @@
 import json
 import tempfile
+import threading
+import http.client
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -7,6 +9,78 @@ import server
 
 
 class MonitorTests(unittest.TestCase):
+    def test_edit_preserves_id_history_ports_and_blank_credentials(self):
+        with tempfile.TemporaryDirectory(dir=server.ROOT) as directory:
+            config=Path(directory)/'config.json'
+            config.write_text('[]')
+            with patch.object(server,'CONFIG',config),patch.object(server,'DATA',Path(directory)/'data'):
+                identifier=server.add_server({'host':'one.example.com','name':'Uno','whmToken':'whm-original','metricsToken':'metrics-original','metrics_url':'https://one.example.com/metrics'})
+                with server.connect_db() as db:
+                    db.execute('INSERT INTO checks VALUES (?, ?, ?, ?, ?)',(identifier,123,1,10,2))
+                server.update_server(identifier,{'name':'Nuevo nombre','host':'renamed.example.com','whm_port':'2099','whm_user':'admin','whmToken':'','metricsToken':''})
+                cfg=server.read_config()[0]
+                self.assertEqual(cfg['id'],identifier)
+                self.assertEqual(cfg['host'],'renamed.example.com')
+                self.assertEqual(cfg['ports'],{'HTTPS':443,'WHM':2099,'cPanel':2083,'SSH':22})
+                self.assertEqual(json.loads((server.DATA/'secrets.json').read_text())[identifier],{'whmToken':'whm-original','metricsToken':'metrics-original'})
+                with server.connect_db() as db:
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM checks WHERE server=?',(identifier,)).fetchone()[0],1)
+                settings=server.server_settings(identifier)
+                self.assertEqual(settings['name'],'Nuevo nombre')
+                self.assertTrue(settings['hasWhmToken'])
+                self.assertTrue(settings['hasMetricsToken'])
+                self.assertNotIn('original',json.dumps(settings))
+
+    def test_edit_rotates_and_explicitly_removes_credentials(self):
+        with tempfile.TemporaryDirectory(dir=server.ROOT) as directory:
+            config=Path(directory)/'config.json';config.write_text('[]')
+            with patch.object(server,'CONFIG',config),patch.object(server,'DATA',Path(directory)/'data'):
+                identifier=server.add_server({'host':'one.example.com','whmToken':'old','metricsToken':'old-metrics','metrics_url':'https://one.example.com/metrics'})
+                server.update_server(identifier,{'whmToken':'new'})
+                self.assertEqual(json.loads((server.DATA/'secrets.json').read_text())[identifier]['whmToken'],'new')
+                server.update_server(identifier,{'clearWhmToken':True,'clearMetricsToken':True})
+                cfg=server.read_config()[0]
+                self.assertNotIn('whm_token_env',cfg)
+                self.assertNotIn('metrics_url',cfg)
+                self.assertNotIn('metrics_token_env',cfg)
+                self.assertEqual(json.loads((server.DATA/'secrets.json').read_text())[identifier],{})
+
+    def test_invalid_edit_leaves_existing_config_and_secrets_unchanged(self):
+        with tempfile.TemporaryDirectory(dir=server.ROOT) as directory:
+            config=Path(directory)/'config.json';config.write_text('[]')
+            with patch.object(server,'CONFIG',config),patch.object(server,'DATA',Path(directory)/'data'):
+                identifier=server.add_server({'host':'one.example.com','whmToken':'original'})
+                server.add_server({'host':'two.example.com'})
+                before=[(server.DATA/name).read_bytes() for name in ['servers.json','secrets.json']]
+                for payload in [{'host':'two.example.com'},{'whm_port':0},{'host':'bad/path'},{'whmToken':'bad\ntoken'},{'metrics_url':'http://one.example.com'},{'metrics_url':'https://one.example.com/metrics'}]:
+                    with self.assertRaises(ValueError):server.update_server(identifier,payload)
+                self.assertEqual(before,[(server.DATA/name).read_bytes() for name in ['servers.json','secrets.json']])
+                with self.assertRaises(server.ServerNotFound):server.update_server('missing',{})
+
+    def test_edit_api_requires_session_csrf_and_authorized_origin(self):
+        current={'username':'admin','csrf':'test-csrf'}
+        with patch.object(server.Handler,'current_session',return_value=current),patch.dict(server.os.environ,{'ALLOWED_ORIGIN':'https://monitor.example.com'}),patch.object(server,'server_settings',return_value={'id':'one','hasWhmToken':True}),patch.object(server,'update_server',return_value='one') as update:
+            httpd=server.BoundedHTTPServer(('127.0.0.1',0),server.Handler)
+            thread=threading.Thread(target=httpd.serve_forever,daemon=True);thread.start()
+            def request(method,headers=None):
+                conn=http.client.HTTPConnection('127.0.0.1',httpd.server_port,timeout=3)
+                conn.request(method,'/api/servers/one','{}' if method=='POST' else None,headers or {})
+                response=conn.getresponse();body=response.read();conn.close();return response.status,body
+            try:
+                self.assertEqual(request('GET')[0],200)
+                headers={'Origin':'https://monitor.example.com','Content-Type':'application/json'}
+                self.assertEqual(request('POST',headers)[0],403)
+                headers['X-CSRF-Token']='test-csrf'
+                self.assertEqual(request('POST',headers)[0],200)
+                headers['Origin']='https://untrusted.example.com'
+                self.assertEqual(request('POST',headers)[0],403)
+                with patch.object(server.Handler,'current_session',return_value=None):
+                    self.assertEqual(request('GET')[0],401)
+                    headers['Origin']='https://monitor.example.com'
+                    self.assertEqual(request('POST',headers)[0],401)
+                self.assertEqual(update.call_count,1)
+            finally:httpd.shutdown();httpd.server_close();thread.join()
+
     def test_add_server_separates_secrets_and_rejects_duplicates(self):
         with tempfile.TemporaryDirectory(dir=server.ROOT) as directory:
             config=Path(directory)/'config.json'

@@ -87,7 +87,7 @@ def check_server(cfg):
     result = dict(id=cfg['id'], name=cfg.get('name', host), status='healthy' if ok else 'down', disk=None, load=None, cpu=None, ram=None, latency=latency, checkedAt=time.time(), diskUsedGb=None, diskTotalGb=None, bootSeconds=None, services={k: v[0] for k, v in results.items()}, whmUrl=f'https://{host}:{ports.get("WHM",2087)}', cpanelUrl=f'https://{host}:{ports.get("cPanel",2083)}', error='')
     errors = []
     if cfg.get('metrics_url'):
-        token = os.getenv(cfg.get('metrics_token_env', ''), '') or SECRETS.get(cfg['id'],{}).get('metricsToken','')
+        token = SECRETS.get(cfg['id'],{}).get('metricsToken','') or os.getenv(cfg.get('metrics_token_env', ''), '')
         try:
             if not token:
                 raise ValueError('Missing collector token')
@@ -98,7 +98,7 @@ def check_server(cfg):
         except Exception:
             errors.append('Recolector no disponible: revisar conexión o credenciales.')
     if cfg.get('whm_token_env'):
-        token = os.getenv(cfg['whm_token_env'], '') or SECRETS.get(cfg['id'],{}).get('whmToken','')
+        token = SECRETS.get(cfg['id'],{}).get('whmToken','') or os.getenv(cfg['whm_token_env'], '')
         try:
             if not token:
                 raise ValueError('Missing WHM token')
@@ -243,6 +243,83 @@ def add_server(payload):
     return identifier
 
 
+class ServerNotFound(ValueError):
+    pass
+
+
+def server_settings(identifier):
+    """Return editable connection fields without exposing credential values."""
+    with CONFIG_LOCK:
+        cfg = next((c for c in read_config() if c['id'] == identifier), None)
+        if cfg is None:
+            raise ServerNotFound()
+        path = DATA / 'secrets.json'
+        credentials = json.loads(path.read_text(encoding='utf-8')).get(identifier, {}) if path.exists() else {}
+        return dict(id=identifier, name=cfg.get('name', cfg['host']), host=cfg['host'],
+                    whm_user=cfg.get('whm_user', 'root'), whm_port=cfg.get('ports', {}).get('WHM', 2087),
+                    metrics_url=cfg.get('metrics_url', ''),
+                    hasWhmToken=bool(credentials.get('whmToken') or os.getenv(cfg.get('whm_token_env', ''), '')),
+                    hasMetricsToken=bool(credentials.get('metricsToken') or os.getenv(cfg.get('metrics_token_env', ''), '')))
+
+
+def update_server(identifier, payload):
+    """Keep the immutable ID/history and preserve blank credential fields."""
+    from urllib.parse import urlsplit
+    import copy
+    with CONFIG_LOCK:
+        configs = read_config()
+        index = next((i for i, c in enumerate(configs) if c['id'] == identifier), None)
+        if index is None:
+            raise ServerNotFound()
+        cfg = copy.deepcopy(configs[index])
+        host = str(payload.get('host', cfg['host'])).strip().lower()
+        if any(c['id'] != identifier and c['host'].lower() == host for c in configs):
+            raise ValueError('Este servidor ya está añadido')
+        name = str(payload.get('name', cfg.get('name', host))).strip()
+        user = str(payload.get('whm_user', cfg.get('whm_user', 'root'))).strip()
+        if not name or len(name) > 100 or not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', user):
+            raise ValueError('Nombre o usuario inválido')
+        cfg.update(host=host, name=name, whm_user=user)
+        cfg['ports'] = dict(cfg.get('ports', {'HTTPS':443, 'WHM':2087, 'cPanel':2083, 'SSH':22}))
+        cfg['ports']['WHM'] = int(payload.get('whm_port', cfg['ports']['WHM']))
+        secrets_path = DATA / 'secrets.json'
+        secrets = json.loads(secrets_path.read_text(encoding='utf-8')) if secrets_path.exists() else {}
+        credentials = dict(secrets.get(identifier, {}))
+        for field, clear, env_key, prefix in (
+            ('whmToken', 'clearWhmToken', 'whm_token_env', 'WHM_'),
+            ('metricsToken', 'clearMetricsToken', 'metrics_token_env', 'METRICS_')
+        ):
+            value = str(payload.get(field, ''))
+            if len(value) > 1024 or any(ord(c) < 32 for c in value):
+                raise ValueError('Token inválido')
+            if payload.get(clear) is True:
+                credentials.pop(field, None)
+                cfg.pop(env_key, None)
+            elif value:
+                credentials[field] = value
+                cfg[env_key] = prefix + identifier.upper().replace('-', '_') + '_TOKEN'
+        metrics_url = str(payload.get('metrics_url', cfg.get('metrics_url', ''))).strip()
+        if payload.get('clearMetricsToken') is True:
+            metrics_url = ''
+        if metrics_url:
+            url = urlsplit(metrics_url)
+            if url.scheme != 'https' or not url.hostname or url.username or url.password or len(metrics_url) > 1000:
+                raise ValueError('El recolector requiere una URL HTTPS válida')
+            if not (credentials.get('metricsToken') or os.getenv(cfg.get('metrics_token_env', ''), '')):
+                raise ValueError('Falta el token del recolector')
+            cfg['metrics_url'] = metrics_url
+        else:
+            cfg.pop('metrics_url', None)
+        configs[index] = cfg
+        validate_config(configs)
+        secrets[identifier] = credentials
+        DATA.mkdir(parents=True, exist_ok=True)
+        save_json(secrets_path, secrets)
+        save_json(DATA / 'servers.json', configs)
+    WAKE.set()
+    return identifier
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
@@ -276,7 +353,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.headers.get('Origin')!=origin or self.headers.get('Content-Type','').split(';')[0]!='application/json':
             self.send_error(403)
             return
-        if self.path not in ('/api/servers','/api/login','/api/logout'):
+        edit_match = re.fullmatch(r'/api/servers/([a-zA-Z0-9_-]{1,64})', self.path)
+        if self.path not in ('/api/servers','/api/login','/api/logout') and not edit_match:
             self.send_error(404)
             return
         current=self.current_session() if self.path!='/api/login' else None
@@ -310,9 +388,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 auth.logout(self.headers.get('Cookie',''))
                 self.json_response(200,{'ok':True},auth.set_cookie(clear=True))
                 return
-            identifier=add_server(payload)
+            identifier=update_server(edit_match[1], payload) if edit_match else add_server(payload)
             raw=json.dumps({'ok':True,'id':identifier}).encode()
-            status=201
+            status=200 if edit_match else 201
+        except ServerNotFound:
+            raw=json.dumps({'error':'El servidor ya no está disponible.'}).encode()
+            status=404
         except (ValueError,TypeError,KeyError):
             raw=json.dumps({'error':'No se pudo guardar. Revisa hostname, puerto, tokens y posibles duplicados.'}).encode()
             status=400
@@ -338,6 +419,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path=='/api/session':
             self.json_response(200,{'username':current['username'],'csrf':current['csrf']})
+            return
+        edit_match = re.fullmatch(r'/api/servers/([a-zA-Z0-9_-]{1,64})', path)
+        if edit_match:
+            try:
+                self.json_response(200, server_settings(edit_match[1]))
+            except ServerNotFound:
+                self.json_response(404, {'error':'El servidor ya no está disponible.'})
             return
         if path == '/api/status':
             with LOCK:
